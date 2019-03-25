@@ -44,7 +44,8 @@
     size = 5 :: non_neg_integer(),
     overflow = 0 :: non_neg_integer(),
     max_overflow = 10 :: non_neg_integer(),
-    strategy = lifo :: lifo | fifo
+    strategy = lifo :: lifo | fifo,
+    lazy = false :: boolean()
 }).
 
 -spec checkout(Pool :: pool()) -> pid().
@@ -167,8 +168,13 @@ init([{strategy, lifo} | Rest], WorkerArgs, State) ->
     init(Rest, WorkerArgs, State#state{strategy = lifo});
 init([{strategy, fifo} | Rest], WorkerArgs, State) ->
     init(Rest, WorkerArgs, State#state{strategy = fifo});
+init([{lazy, true} | Rest], WorkerArgs, State) ->
+    init(Rest, WorkerArgs, State#state{lazy = true});
 init([_ | Rest], WorkerArgs, State) ->
     init(Rest, WorkerArgs, State);
+init([], _WorkerArgs, #state{size = Size, lazy = true} = State) ->
+    Workers = prepopulate_empty(Size),
+    {ok, State#state{workers = Workers}};
 init([], _WorkerArgs, #state{size = Size, supervisor = Sup} = State) ->
     Workers = prepopulate(Size, Sup),
     {ok, State#state{workers = Workers}}.
@@ -213,6 +219,14 @@ handle_call({checkout, CRef, Block}, {FromPid, _} = From, State) ->
            max_overflow = MaxOverflow,
            strategy = Strategy} = State,
     case get_worker_with_strategy(Workers, Strategy) of
+        {{value, undefined}, Left} ->
+            case new_worker(Sup, FromPid) of
+                {ok, Pid, MRef} ->
+                    true = ets:insert(Monitors, {Pid, CRef, MRef}),
+                    {reply, {ok, Pid}, State#state{workers = Left}};
+                {error, _} = E ->
+                    {reply, E, State}
+            end;
         {{value, Pid},  Left} ->
             MRef = erlang:monitor(process, FromPid),
             true = ets:insert(Monitors, {Pid, CRef, MRef}),
@@ -277,6 +291,9 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
             {noreply, NewState};
         [] ->
             case queue:member(Pid, State#state.workers) of
+                true when State#state.lazy =:= true ->
+                    W = filter_worker_by_pid(Pid, State#state.workers),
+                    {noreply, State#state{workers = queue:in(undefined, W)}};
                 true ->
                     W = filter_worker_by_pid(Pid, State#state.workers),
                     {ok, NewWorker} = new_worker(Sup),
@@ -291,7 +308,7 @@ handle_info(_Info, State) ->
 
 terminate(_Reason, State) ->
     Workers = queue:to_list(State#state.workers),
-    ok = lists:foreach(fun (W) -> unlink(W) end, Workers),
+    ok = lists:foreach(fun (undefined) -> ok; (W) -> unlink(W) end, Workers),
     true = exit(State#state.supervisor, shutdown),
     ok.
 
@@ -347,6 +364,13 @@ prepopulate(N, Sup, Workers) ->
     {ok, NewWorker} = new_worker(Sup),
     prepopulate(N-1, Sup, queue:in(NewWorker, Workers)).
 
+
+prepopulate_empty(N) when N < 1 ->
+    queue:new();
+prepopulate_empty(N) ->
+    queue:from_list([undefined || _ <- lists:seq(1, N)]).
+
+
 handle_checkin(Pid, State) ->
     #state{supervisor = Sup,
            waiting = Waiting,
@@ -377,6 +401,10 @@ handle_worker_exit(Pid, State) ->
             State#state{waiting = LeftWaiting};
         {empty, Empty} when Overflow > 0 ->
             State#state{overflow = Overflow - 1, waiting = Empty};
+        {empty, Empty} when State#state.lazy =:= true ->
+            W = filter_worker_by_pid(Pid, State#state.workers),
+            Workers = queue:in(undefined, W),
+            State#state{workers = Workers, waiting = Empty};
         {empty, Empty} ->
             W = filter_worker_by_pid(Pid, State#state.workers),
             {ok, NewWorker} = new_worker(Sup),
